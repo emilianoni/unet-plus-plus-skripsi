@@ -47,11 +47,20 @@ def get_transform(img_size, use_augment=False, aug_type='balanced'):
                 A.RandomBrightnessContrast(
                     brightness_limit=0.3, contrast_limit=0.2, p=0.5)
             ])
+        elif aug_type == 'color_safe':
+            transform_list.extend([
+                A.HorizontalFlip(p=0.5),
+                A.VerticalFlip(p=0.5),
+                A.Rotate(limit=45, p=0.5,
+                        border_mode=cv2.BORDER_CONSTANT,
+                        value=0, mask_value=2,
+                        mask_interpolation=cv2.INTER_NEAREST),
+                A.RandomBrightnessContrast(
+                    brightness_limit=0.1, contrast_limit=0.1, p=0.3)
+    ])
 
     transform_list.extend([
-        A.Normalize(mean=[0.485, 0.456, 0.406],
-                    std=[0.229, 0.224, 0.225],
-                    max_pixel_value=255.0),
+        A.ToFloat(max_value=255.0),  # konversi uint8 → float32, bagi 255
         ToTensorV2()
     ])
 
