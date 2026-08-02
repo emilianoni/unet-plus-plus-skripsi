@@ -12,7 +12,7 @@ import argparse
 from matplotlib.colors import ListedColormap
 
 from dataset_loader import get_loaders
-from unet_model import UNetPlusPlus, ModifiedHybridLoss
+from unet_model import UNetPlusPlus, UNetPlusPlusVGG16, ModifiedHybridLoss
 
 os.makedirs('outputs', exist_ok=True)
 os.makedirs('models', exist_ok=True)
@@ -35,15 +35,45 @@ parser.add_argument('--dice_w',      type=float, default=0.5)
 parser.add_argument('--focal_w',     type=float, default=0.0)
 parser.add_argument('--focal_gamma', type=float, default=2)
 
+# ── Opsi Loss Zhou ──────────────────────────────────────────────────────
+# --no_class_weights : nonaktifkan class weighting (Eksperimen A & C)
+# --use_zhou_dice    : ganti penyebut Dice ke y^2+p^2 (Eksperimen B & C)
+parser.add_argument('--no_class_weights', action='store_true',
+                    help='Nonaktifkan class weighting pada loss')
+parser.add_argument('--use_zhou_dice',    action='store_true',
+                    help='Pakai Dice penyebut y^2+p^2 persis Zhou et al.')
+
 # Augmentasi
-parser.add_argument('--use_augment',     action='store_true')
-parser.add_argument('--aug_type',        type=str, default='balanced',
-                    choices=['balanced', 'spatial', 'extreme'])
+parser.add_argument('--use_augment',  action='store_true')
+parser.add_argument('--aug_type',     type=str, default='balanced',
+                    choices=['balanced', 'spatial', 'extreme', 'color_safe'])
 
 # Class-aware sampling
 parser.add_argument('--use_class_aware', action='store_true',
                     help='Aktifkan WeightedRandomSampler untuk '
                          'class-aware sampling')
+
+# Scheduler dan dropout
+parser.add_argument('--scheduler', type=str, default='none',
+                    choices=['none', 'step', 'cosine', 'plateau'])
+parser.add_argument('--drop_rate', type=float, default=0.0)
+
+# Ukuran model
+parser.add_argument('--model_size', type=str, default='normal',
+                    choices=['normal', 'small'])
+
+# Dataset
+parser.add_argument('--dataset_path', type=str,
+                    default='dataset',
+                    help='Path ke folder dataset')
+
+# Class Weights
+parser.add_argument('--use_iou_weights', action='store_true',
+                    help='Pakai class weights berbasis IoU S10')
+
+# StepLR
+parser.add_argument('--step_size', type=int, default=25)
+parser.add_argument('--gamma', type=float, default=0.1)
 
 args = parser.parse_args()
 
@@ -64,10 +94,13 @@ custom_cmap    = ListedColormap(warna_penyakit)
 # ==========================================
 criterion = ModifiedHybridLoss(
     device,
-    ce_weight    = args.ce_w,
-    dice_weight  = args.dice_w,
-    focal_weight = args.focal_w,
-    focal_gamma  = args.focal_gamma
+    ce_weight         = args.ce_w,
+    dice_weight       = args.dice_w,
+    focal_weight      = args.focal_w,
+    focal_gamma       = args.focal_gamma,
+    use_class_weights = not args.no_class_weights,
+    use_zhou_dice     = args.use_zhou_dice,
+    use_iou_weights   = args.use_iou_weights  # ← tambah ini
 )
 
 # ==========================================
@@ -103,9 +136,7 @@ def evaluasi_model(loader, model_obj,
 
             if simpan_preview and batch_idx == 0:
                 img_vis = imgs[0].cpu().permute(1, 2, 0).numpy()
-                img_vis = (img_vis * np.array([0.229, 0.224, 0.225])
-                           + np.array([0.485, 0.456, 0.406]))
-                img_vis = np.clip(img_vis, 0, 1)
+                img_vis = np.clip(img_vis, 0, 1)  # sudah [0,1], tidak perlu de-normalisasi
 
                 fig, axes = plt.subplots(1, 3, figsize=(15, 5))
                 axes[0].imshow(img_vis)
@@ -136,28 +167,39 @@ def evaluasi_model(loader, model_obj,
 # ==========================================
 if __name__ == '__main__':
     print("=" * 60)
-    print(f"⚙️  MESIN MENYALA: {args.tag}")
-    print(f"📐 Res:{args.img_size} | BS:{args.batch_size} | "
+    print(f"MESIN MENYALA: {args.tag}")
+    print(f"Res:{args.img_size} | BS:{args.batch_size} | "
           f"LR:{args.lr} | Opt:{args.optimizer}")
-    print(f"⚖️  CE:{args.ce_w} | Dice:{args.dice_w} | "
-          f"Focal:{args.focal_w}(γ={args.focal_gamma})")
-    print(f"🌿 Aug:{args.use_augment}({args.aug_type}) | "
+    print(f"CE:{args.ce_w} | Dice:{args.dice_w} | "
+          f"Focal:{args.focal_w}(gamma={args.focal_gamma})")
+    print(f"ClassWeights:{not args.no_class_weights} | "
+          f"ZhouDice:{args.use_zhou_dice}")
+    print(f"Aug:{args.use_augment}({args.aug_type}) | "
           f"ClassAware:{args.use_class_aware}")
-    print(f"📊 DS: rata-rata murni (1/4 per cabang, sesuai Zhou et al.)")
+    print(f"Scheduler:{args.scheduler} | "
+          f"Dropout:{args.drop_rate}")
+    print(f"DS: rata-rata murni (1/4 per cabang, sesuai Zhou et al.)")
     print("=" * 60)
 
     # --- DataLoader ---
     train_loader, valid_loader, test_loader = get_loaders(
-        'dataset',
-        batch_size      = args.batch_size,
-        img_size        = args.img_size,
-        use_augment     = args.use_augment,
-        aug_type        = args.aug_type,
-        use_class_aware = args.use_class_aware
-    )
+    args.dataset_path,
+    batch_size      = args.batch_size,
+    img_size        = args.img_size,
+    use_augment     = args.use_augment,
+    aug_type        = args.aug_type,
+    use_class_aware = args.use_class_aware
+)
 
     # --- Model ---
-    model = UNetPlusPlus(input_channels=3, num_classes=7).to(device)
+    model = UNetPlusPlus(
+        input_channels=3,
+        num_classes=7,
+        drop_rate=args.drop_rate,
+        model_size=args.model_size
+    ).to(device)
+    print(f"Model size: {args.model_size} | "
+          f"Params: {sum(p.numel() for p in model.parameters()):,}")
 
     # --- Optimizer ---
     if args.optimizer == 'adam':
@@ -169,6 +211,21 @@ if __name__ == '__main__':
         optimizer = optim.SGD(
             model.parameters(), lr=args.lr,
             momentum=0.9, weight_decay=1e-4)
+
+    # --- Scheduler ---
+    if args.scheduler == 'step':
+        scheduler = optim.lr_scheduler.StepLR(
+            optimizer,
+            step_size=args.step_size,
+            gamma=args.gamma)
+    elif args.scheduler == 'cosine':
+        scheduler = optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=args.epochs)
+    elif args.scheduler == 'plateau':
+        scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer, mode='min', patience=10, factor=0.5)
+    else:
+        scheduler = None
 
     # --- Variabel tracking ---
     best_val_loss = float('inf')
@@ -214,6 +271,13 @@ if __name__ == '__main__':
             simpan_preview=False, nama_fase=""
         )
 
+        # ── STEP SCHEDULER ────────────────────────────────────────
+        if scheduler is not None:
+            if args.scheduler == 'plateau':
+                scheduler.step(avg_val_loss)
+            else:
+                scheduler.step()
+
         current_lr     = optimizer.param_groups[0]['lr']
         epoch_duration = time.time() - epoch_start
 
@@ -229,7 +293,7 @@ if __name__ == '__main__':
         pd.DataFrame(history_data).to_csv(
             f'outputs/hasil_{args.tag}.csv', index=False)
 
-        print(f"   📉 Train:{avg_train_loss:.4f} | "
+        print(f"   Train:{avg_train_loss:.4f} | "
               f"Val:{avg_val_loss:.4f} | "
               f"mIoU:{current_val_miou:.4f} | "
               f"LR:{current_lr:.2e}")
@@ -239,19 +303,19 @@ if __name__ == '__main__':
             best_val_loss = avg_val_loss
             torch.save(model.state_dict(),
                        f'models/model_{args.tag}_BEST_LOSS.pth')
-            print(f"      🟢 REKOR LOSS! ({best_val_loss:.4f})")
+            print(f"      REKOR LOSS! ({best_val_loss:.4f})")
 
         if current_val_miou > best_val_miou:
             best_val_miou = current_val_miou
             torch.save(model.state_dict(),
                        f'models/model_{args.tag}_BEST_MIOU.pth')
-            print(f"      👑 REKOR mIoU! ({best_val_miou:.4f})")
+            print(f"      REKOR mIoU! ({best_val_miou:.4f})")
 
     # ==========================================
     # 6. EVALUASI FINAL
     # ==========================================
     total_jam = (time.time() - global_start) / 3600
-    print(f"\n🎉 TRAINING SELESAI! Total: {total_jam:.2f} jam")
+    print(f"\nTRAINING SELESAI! Total: {total_jam:.2f} jam")
     print(f"   Best Val Loss : {best_val_loss:.4f}")
     print(f"   Best Val mIoU : {best_val_miou:.4f}")
 
@@ -265,7 +329,7 @@ if __name__ == '__main__':
         simpan_preview=True, nama_fase="Valid_Akhir"
     )
 
-    print(f"\n📊 IoU Per Kelas (BEST_MIOU di validasi):")
+    print(f"\nIoU Per Kelas (BEST_MIOU di validasi):")
     for cls_name, iou_val in zip(CLASS_NAMES, final_iou_per_class):
         print(f"   {cls_name:<15}: {iou_val:.4f}")
     print(f"   {'mIoU (macro)':<15}: {final_miou:.4f}")
@@ -314,5 +378,5 @@ if __name__ == '__main__':
     plt.savefig(f'outputs/miou_curve_{args.tag}.png', dpi=300)
     plt.close(fig)
 
-    print(f"\n✅ Grafik tersimpan di folder outputs/")
-    print(f"✅ Model tersimpan di folder models/")
+    print(f"\nGrafik tersimpan di folder outputs/")
+    print(f"Model tersimpan di folder models/")
